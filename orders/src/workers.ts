@@ -62,6 +62,7 @@ export function startWorkers(
               currency: "RUB",
             },
             order.id,
+            4000 * 2 ** Math.min(order.attempts, 3),
           );
           status = response.status;
         } catch {

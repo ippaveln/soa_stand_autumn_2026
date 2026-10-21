@@ -3,6 +3,7 @@ export async function call(
   method = "GET",
   body?: unknown,
   key?: string,
+  timeoutMs = 4000,
 ): Promise<{ status: number; body: unknown }> {
   const response = await fetch(url, {
     method,
@@ -11,7 +12,7 @@ export async function call(
       ...(key ? { "Idempotency-Key": key } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(4000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
   return { status: response.status, body: text ? JSON.parse(text) : null };

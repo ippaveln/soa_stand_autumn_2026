@@ -208,4 +208,79 @@ test("PostgreSQL: валидация, транзакции и восстанов
       }
     },
   );
+  await t.test(
+    "медленный отказ банка снимает резерв и завершает заказ",
+    async () => {
+      let reserved = false;
+      const keys = [];
+      let lookups = 0;
+      const server = createServer(async (request, response) => {
+        for await (const chunk of request) {
+          void chunk;
+        }
+        if (request.url === "/payments" && request.method === "POST") {
+          keys.push(request.headers["idempotency-key"]);
+          const timer = setTimeout(() => {
+            response.writeHead(402, { "Content-Type": "application/json" });
+            response.end('{"error":"declined"}');
+          }, 4200);
+          response.on("close", () => clearTimeout(timer));
+          return;
+        }
+        if (request.url.startsWith("/payments?")) {
+          lookups++;
+          response.end("[]");
+          return;
+        }
+        if (request.method === "DELETE") {
+          reserved = false;
+          response.writeHead(204).end();
+          return;
+        }
+        reserved = true;
+        response.writeHead(201).end("{}");
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = `http://127.0.0.1:${server.address().port}`;
+      const created = await app.inject({
+        method: "POST",
+        url: "/orders",
+        payload: {
+          user_id: "slow-decline",
+          items: [{ sku: "a", qty: 1, price_cents: 100 }],
+        },
+      });
+      assert.equal(created.statusCode, 201);
+      assert.equal(created.json().status, "pending");
+      const id = created.json().id;
+      const stop = startWorkers(db, {
+        payment: address,
+        inventory: address,
+        events: address,
+      });
+      try {
+        const deadline = Date.now() + 12000;
+        let status;
+        do {
+          await delay(100);
+          status = (await app.inject(`/orders/${id}`)).json().status;
+        } while (status === "pending" && Date.now() < deadline);
+        assert.equal(status, "rejected");
+        assert.equal(reserved, false);
+        assert.ok(keys.length >= 2);
+        assert.ok(lookups >= 1);
+        assert.deepEqual([...new Set(keys)], [id]);
+        assert.equal(
+          (await db.query("SELECT id FROM outbox WHERE order_id = $1", [id]))
+            .rowCount,
+          0,
+        );
+      } finally {
+        await stop();
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+  );
 });
