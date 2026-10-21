@@ -1,0 +1,24 @@
+{
+  "name": "orders",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "format": "prettier --write src test *.json *.md",
+    "format:check": "prettier --check src test *.json *.md",
+    "test:integration": "npm run build && node --test test/database.integration.mjs"
+  },
+  "dependencies": {
+    "fastify": "5.12.7",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
+  }
+}

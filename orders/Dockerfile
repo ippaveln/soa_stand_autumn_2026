@@ -1,11 +1,18 @@
-FROM golang:1.26-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY *.go ./
-RUN CGO_ENABLED=0 go build -trimpath -o /out/orders .
+FROM node:24-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/orders /orders
+FROM node:24-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+COPY schema.sql ./
+USER node
 EXPOSE 8080
-ENTRYPOINT ["/orders"]
+CMD ["node", "dist/main.js"]
