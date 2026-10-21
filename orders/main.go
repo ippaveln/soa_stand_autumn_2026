@@ -1,11 +1,7 @@
-// Orders — наивная реализация.
-//
-// Оформление заказа: зарезервировать товар в Inventory, списать деньги в
-// Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
+// Orders persists accepted orders before making any external calls.
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -13,27 +9,56 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const schema = `
 CREATE TABLE IF NOT EXISTS orders (
-    id           TEXT PRIMARY KEY,
-    user_id      TEXT NOT NULL,
-    status       TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL,
-    items        JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-)`
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'rejected')),
+    amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
+    items JSONB NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'reserve',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS orders_pending_due
+    ON orders (next_attempt_at, created_at) WHERE status = 'pending';
+CREATE TABLE IF NOT EXISTS paid_outbox (
+    order_id TEXT PRIMARY KEY REFERENCES orders(id),
+    event_id TEXT NOT NULL UNIQUE,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent BOOLEAN NOT NULL DEFAULT false,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS paid_outbox_due
+    ON paid_outbox (next_attempt_at) WHERE NOT sent;
+CREATE TABLE IF NOT EXISTS delivery_inbox (
+    event_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    bonus_points BIGINT NOT NULL CHECK (bonus_points > 0)
+);
+CREATE TABLE IF NOT EXISTS bonus_balances (
+    user_id TEXT PRIMARY KEY,
+    points BIGINT NOT NULL CHECK (points >= 0)
+);
+`
 
 type Item struct {
 	SKU        string `json:"sku"`
-	Qty        int    `json:"qty"`
+	Qty        int64  `json:"qty"`
 	PriceCents int64  `json:"price_cents"`
 }
 
@@ -46,221 +71,193 @@ type app struct {
 	db           *pgxpool.Pool
 	paymentURL   string
 	inventoryURL string
+	eventsURL    string
+	client       *http.Client
+	breaker      paymentBreaker
 }
 
 func main() {
-	a := &app{
-		paymentURL:   strings.TrimRight(mustEnv("PAYMENT_URL"), "/"),
-		inventoryURL: strings.TrimRight(mustEnv("INVENTORY_URL"), "/"),
-	}
-	db, err := connect(mustEnv("DATABASE_URL"))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	db, err := connect(ctx, mustEnv("DATABASE_URL"))
 	if err != nil {
-		slog.Error("база", "err", err)
+		slog.Error("database", "err", err)
 		os.Exit(1)
 	}
-	a.db = db
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("POST /orders", a.createOrder)
-	mux.HandleFunc("GET /orders/{id}", a.getOrder)
-
+	defer db.Close()
+	a := &app{
+		db:           db,
+		paymentURL:   strings.TrimRight(mustEnv("PAYMENT_URL"), "/"),
+		inventoryURL: strings.TrimRight(mustEnv("INVENTORY_URL"), "/"),
+		eventsURL:    strings.TrimRight(mustEnv("EVENTS_URL"), "/"),
+		client:       &http.Client{Timeout: 4 * time.Second},
+	}
+	for range 8 {
+		go a.worker(ctx)
+	}
+	for range 4 {
+		go a.eventWorker(ctx)
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	slog.Info("orders: слушаю", "port", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	srv := &http.Server{Addr: ":" + port, Handler: a.routes(), ReadHeaderTimeout: 2 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	slog.Info("orders listening", "port", port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server", "err", err)
 		os.Exit(1)
 	}
 }
 
-// connect ждёт базу: она может подниматься дольше сервиса.
-func connect(url string) (*pgxpool.Pool, error) {
-	var lastErr error
-	for range 60 {
-		db, err := pgxpool.New(context.Background(), url)
-		if err == nil {
-			if _, err = db.Exec(context.Background(), schema); err == nil {
-				return db, nil
-			}
-			db.Close()
-		}
-		lastErr = err
-		slog.Info("база недоступна, жду", "err", err)
-		time.Sleep(time.Second)
+func connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	// Workers never hold a database connection during network calls.
+	config.MaxConns = 16
+	config.ConnConfig.ConnectTimeout = 2 * time.Second
+	db, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	for range 60 {
+		attempt, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err = db.Exec(attempt, schema)
+		cancel()
+		if err == nil {
+			return db, nil
+		}
+		if !pause(ctx, time.Second) {
+			break
+		}
+	}
+	db.Close()
+	return nil, err
+}
+
+func (a *app) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		defer cancel()
+		if err := a.db.Ping(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database_unavailable"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /orders", a.createOrder)
+	mux.HandleFunc("GET /orders/{id}", a.getOrder)
+	mux.HandleFunc("POST /webhooks/delivery", a.delivery)
+	mux.HandleFunc("GET /users/{id}/bonus", a.bonus)
+	return mux
 }
 
 func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req OrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !valid(req) {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
+		return
+	}
+	amount, valid := orderAmount(req)
+	// A second JSON value or trailing garbage is not a single order.
+	if !valid || dec.Decode(new(any)) != io.EOF {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
 		return
 	}
 	id := newID()
-	var amount int64
-	for _, it := range req.Items {
-		amount += int64(it.Qty) * it.PriceCents
-	}
-
-	if err := a.reserve(id, req.Items); err != nil {
-		a.fail(w, id, err)
-		return
-	}
-	declined, err := a.charge(id, amount)
-	if err != nil {
-		a.fail(w, id, err)
-		return
-	}
-	status := "paid"
-	if declined {
-		a.release(id)
-		status = "rejected"
-	}
-
 	items, _ := json.Marshal(req.Items)
-	_, err = a.db.Exec(context.Background(),
-		`INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES ($1, $2, $3, $4, $5)`,
-		id, req.UserID, status, amount, items)
+	ctx, cancel := context.WithTimeout(r.Context(), 700*time.Millisecond)
+	defer cancel()
+	_, err := a.db.Exec(ctx,
+		`INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES ($1,$2,'pending',$3,$4)`,
+		id, req.UserID, amount, items)
 	if err != nil {
-		a.fail(w, id, err)
+		// A database outage cannot be acknowledged as a durable acceptance.
+		// The stand keeps Postgres available; neighbour failures never reach here.
+		slog.Error("accept order", "id", id, "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database_unavailable"})
 		return
 	}
-	slog.Info("order", "id", id, "status", status)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": status})
-}
-
-func (a *app) fail(w http.ResponseWriter, id string, err error) {
-	slog.Error("POST /orders", "id", id, "err", err)
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "message": err.Error()})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": "pending"})
 }
 
 func (a *app) getOrder(w http.ResponseWriter, r *http.Request) {
-	var (
-		id, status string
-		amount     int64
-	)
-	err := a.db.QueryRow(r.Context(), `SELECT id, status, amount_cents FROM orders WHERE id = $1`,
+	var id, status string
+	var amount int64
+	ctx, cancel := context.WithTimeout(r.Context(), 700*time.Millisecond)
+	defer cancel()
+	err := a.db.QueryRow(ctx, `SELECT id, status, amount_cents FROM orders WHERE id=$1`,
 		r.PathValue("id")).Scan(&id, &status, &amount)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database_unavailable"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": status, "amount_cents": amount})
 }
 
-func (a *app) reserve(id string, items []Item) error {
-	type resvItem struct {
-		SKU string `json:"sku"`
-		Qty int    `json:"qty"`
+func orderAmount(r OrderRequest) (int64, bool) {
+	if strings.TrimSpace(r.UserID) == "" || len(r.Items) == 0 {
+		return 0, false
 	}
-	ri := make([]resvItem, 0, len(items))
-	for _, it := range items {
-		ri = append(ri, resvItem{it.SKU, it.Qty})
-	}
-	code, err := call(http.MethodPost, a.inventoryURL+"/reservations", map[string]any{"order_id": id, "items": ri})
-	if err != nil {
-		return err
-	}
-	if code != http.StatusOK && code != http.StatusCreated {
-		return fmt.Errorf("inventory: %d", code)
-	}
-	return nil
-}
-
-func (a *app) release(id string) {
-	_, _ = call(http.MethodDelete, a.inventoryURL+"/reservations/"+id, nil)
-}
-
-var errPayment = errors.New("payment")
-
-// charge списывает деньги; declined — банк отказал.
-func (a *app) charge(id string, amount int64) (declined bool, err error) {
-	declined, err = a.chargeOnce(id, amount)
-	if err != nil {
-		slog.Warn("оплата не прошла, пробую ещё раз", "id", id, "err", err)
-		declined, err = a.chargeOnce(id, amount)
-	}
-	return declined, err
-}
-
-func (a *app) chargeOnce(id string, amount int64) (bool, error) {
-	code, err := call(http.MethodPost, a.paymentURL+"/payments", map[string]any{
-		"order_id":     id,
-		"amount_cents": amount,
-		"currency":     "RUB",
-	})
-	if err != nil {
-		return false, err
-	}
-	switch code {
-	case http.StatusOK, http.StatusCreated:
-		return false, nil
-	case http.StatusPaymentRequired:
-		return true, nil
-	}
-	return false, fmt.Errorf("%w: %d", errPayment, code)
-}
-
-func call(method, url string, body any) (int, error) {
-	var rd io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
-		}
-		rd = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, url, rd)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
-}
-
-func valid(r OrderRequest) bool {
-	if r.UserID == "" || len(r.Items) == 0 {
-		return false
-	}
+	var amount int64
 	for _, it := range r.Items {
-		if it.SKU == "" || it.Qty < 1 || it.PriceCents < 0 {
-			return false
+		if strings.TrimSpace(it.SKU) == "" || it.Qty < 1 || it.PriceCents < 0 {
+			return 0, false
 		}
+		if it.PriceCents > (math.MaxInt64-amount)/it.Qty {
+			return 0, false
+		}
+		amount += it.Qty * it.PriceCents
 	}
-	return true
+	return amount, true
 }
 
 func newID() string {
 	var b [16]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
+func writeJSON(w http.ResponseWriter, code int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
-func mustEnv(k string) string {
-	v := os.Getenv(k)
+func mustEnv(key string) string {
+	v := os.Getenv(key)
 	if v == "" {
-		slog.Error("не задана переменная окружения", "name", k)
+		slog.Error("missing environment variable", "name", key)
 		os.Exit(1)
 	}
 	return v
+}
+
+func pause(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
